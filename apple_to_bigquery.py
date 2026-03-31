@@ -250,8 +250,8 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
                             headers=auth(), timeout=60)
         if resp.status_code == 200:
             return tsv_rows(resp.content)
-        elif resp.status_code == 404:
-            return []
+        elif resp.status_code in (400, 404):
+            return []  # No data or not applicable for this account
         else:
             log.warning(f"  {report_type}/{report_date}: HTTP {resp.status_code}")
             return []
