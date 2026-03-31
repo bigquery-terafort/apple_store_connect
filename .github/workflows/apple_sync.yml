@@ -1,0 +1,37 @@
+name: Apple App Store Connect → BigQuery Sync
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # 7am UTC daily (after Apple generates reports)
+  workflow_dispatch:
+    inputs:
+      sales_lookback_days:
+        description: "Days of sales history to fetch"
+        default: "7"
+      finance_lookback_months:
+        description: "Months of finance history to fetch"
+        default: "3"
+
+jobs:
+  sync:
+    name: Sync Apple App Store Connect Data to BigQuery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run sync
+        env:
+          APPLE_KEY_ID:           ${{ secrets.APPLE_KEY_ID }}
+          APPLE_ISSUER_ID:        ${{ secrets.APPLE_ISSUER_ID }}
+          APPLE_PRIVATE_KEY:      ${{ secrets.APPLE_PRIVATE_KEY }}
+          APPLE_VENDOR_NUMBER:    ${{ secrets.APPLE_VENDOR_NUMBER }}
+          GCP_PROJECT:            ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON:   ${{ secrets.GCP_CREDENTIALS_JSON }}
+          SALES_LOOKBACK_DAYS:    ${{ github.event.inputs.sales_lookback_days || '7' }}
+          FINANCE_LOOKBACK_MONTHS:${{ github.event.inputs.finance_lookback_months || '3' }}
+        run: python apple_to_bigquery.py
