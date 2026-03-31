@@ -33,5 +33,5 @@ jobs:
           GCP_PROJECT:            ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON:   ${{ secrets.GCP_CREDENTIALS_JSON }}
           SALES_LOOKBACK_DAYS:    ${{ github.event.inputs.sales_lookback_days || '7' }}
-          FINANCE_LOOKBACK_MONTHS:${{ github.event.inputs.finance_lookback_months || '3' }}
+          FINANCE_LOOKBACK_MONTHS: ${{ github.event.inputs.finance_lookback_months || '3' }}
         run: python apple_to_bigquery.py
