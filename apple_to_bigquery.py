@@ -15,9 +15,10 @@ Notes:
   - Subscription tables return HTTP 400 if account has no subscriptions (silently skipped)
   - Analytics ONGOING requests take 24-48h to generate first data after first run
   - Sales data available next day; Finance monthly after Apple closes the period
+  - Finance TSV footer/summary rows are filtered out (non-date Start Date values)
 """
 
-import os, json, gzip, time, io, csv, logging, requests
+import os, re, json, gzip, time, io, csv, logging, requests
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
@@ -27,7 +28,7 @@ import jwt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 APPLE_KEY_ID         = os.environ["APPLE_KEY_ID"].strip()
 APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"].strip()
 APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip()
@@ -40,7 +41,7 @@ FINANCE_LOOKBACK_MONTHS = int(os.environ.get("FINANCE_LOOKBACK_MONTHS", "3"))
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
 
-# ─── JWT AUTH ─────────────────────────────────────────────────────────────────
+# ─── JWT AUTH ────────────────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
 
 def get_jwt():
@@ -62,7 +63,7 @@ def get_jwt():
 def auth():
     return {"Authorization": f"Bearer {get_jwt()}"}
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
 def sf(v):
     try: return float(v) if v not in (None, "", "--", "N/A") else None
     except: return None
@@ -82,6 +83,9 @@ def parse_date(s):
         except: pass
     return s[:10] if len(s) >= 10 else s
 
+def is_valid_date(s):
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}$', str(s or "").strip()))
+
 def tsv_rows(gz_bytes):
     try:
         with gzip.open(io.BytesIO(gz_bytes)) as gz:
@@ -91,9 +95,8 @@ def tsv_rows(gz_bytes):
         log.warning(f"  TSV parse error: {e}")
         return []
 
-# ─── SCHEMAS ──────────────────────────────────────────────────────────────────
+# ─── SCHEMAS ─────────────────────────────────────────────────────────────────
 S = bigquery.SchemaField
-
 SCHEMAS = {
     "sales_daily": [
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
@@ -249,7 +252,7 @@ ANALYTICS_REPORT_MAP = {
     "App Store Pre-orders":               "analytics_app_store_preorders",
 }
 
-# ─── SALES REPORTS ────────────────────────────────────────────────────────────
+# ─── SALES REPORTS ───────────────────────────────────────────────────────────
 def get_sales_report(report_type, report_subtype, frequency, report_date):
     params = {
         "filter[vendorNumber]":  APPLE_VENDOR_NUMBER,
@@ -408,7 +411,7 @@ def fetch_subscriber_daily():
     log.info(f"  ✓ subscriber_daily: {len(rows)} rows")
     return rows
 
-# ─── FINANCE REPORTS ──────────────────────────────────────────────────────────
+# ─── FINANCE REPORTS ─────────────────────────────────────────────────────────
 def fetch_finance_monthly():
     log.info("Fetching Finance Monthly...")
     rows = []
@@ -426,10 +429,15 @@ def fetch_finance_monthly():
             resp = requests.get(f"{BASE_URL}/financeReports", params=params,
                                 headers=auth(), timeout=60)
             if resp.status_code == 200:
+                month_rows = 0
                 for r in tsv_rows(resp.content):
+                    # Skip Apple-appended footer/summary rows (non-date Start Date values)
+                    raw_start = parse_date(r.get("Start Date"))
+                    if not is_valid_date(raw_start):
+                        continue
                     rows.append({
                         "report_month": report_date,
-                        "start_date": parse_date(r.get("Start Date")),
+                        "start_date": raw_start,
                         "end_date": parse_date(r.get("End Date")),
                         "vendor_identifier": r.get("Vendor Identifier"),
                         "quantity": sf(r.get("Quantity")),
@@ -452,7 +460,8 @@ def fetch_finance_monthly():
                         "parent_identifier": r.get("Parent Identifier"),
                         "_ingested_at": now_ts(),
                     })
-                if rows: log.info(f"  Finance {report_date}: ok")
+                    month_rows += 1
+                if month_rows: log.info(f"  Finance {report_date}: {month_rows} rows")
             elif resp.status_code in (400, 404):
                 pass  # No data this month
             else:
@@ -462,7 +471,7 @@ def fetch_finance_monthly():
     log.info(f"  ✓ finance_monthly: {len(rows)} rows")
     return rows
 
-# ─── ANALYTICS ────────────────────────────────────────────────────────────────
+# ─── ANALYTICS ───────────────────────────────────────────────────────────────
 def get_all_apps():
     apps, url = [], f"{BASE_URL}/apps"
     params = {"limit": 200}
@@ -667,7 +676,7 @@ def fetch_all_analytics(apps):
         log.info(f"  ✓ {tbl}: {len(rows)} rows")
     return results
 
-# ─── BIGQUERY ─────────────────────────────────────────────────────────────────
+# ─── BIGQUERY ────────────────────────────────────────────────────────────────
 def get_bq():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GCP_CREDENTIALS_JSON),
@@ -704,7 +713,7 @@ def load_to_bq(bq, name, rows):
     else:
         log.info(f"  ✅ {len(rows):,} rows → {name}")
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
     log.info("🍎 Apple App Store Connect → BigQuery  (14 tables)")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
