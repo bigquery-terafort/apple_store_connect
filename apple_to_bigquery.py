@@ -1,35 +1,40 @@
 """
-Apple App Store Connect → BigQuery  ·  COMPLETE PIPELINE
-=========================================================
-Auth: JWT (ES256), expires every 20 minutes, auto-refreshed
+Apple App Store Connect → BigQuery  ·  COMPLETE FINAL PIPELINE
+=============================================================
+Auth: JWT (ES256), auto-refreshed every 20 minutes
 
-Tables (14 total):
-  SALES REPORTS (4):    sales_daily, subscription_daily, subscription_event_daily, subscriber_daily
-  FINANCE REPORTS (1):  finance_monthly
-  ANALYTICS (9):        analytics_sessions, analytics_installs, analytics_crashes,
-                        analytics_app_store_discovery, analytics_app_store_downloads,
-                        analytics_app_store_purchases, analytics_subscription_state,
-                        analytics_app_store_web_preview, analytics_app_store_preorders
+Tables (14):
+  SALES (4):     sales_daily, subscription_daily, subscription_event_daily, subscriber_daily
+  FINANCE (1):   finance_monthly
+  ANALYTICS (9): analytics_sessions, analytics_installs, analytics_crashes,
+                 analytics_app_store_discovery, analytics_app_store_downloads,
+                 analytics_app_store_purchases, analytics_subscription_state,
+                 analytics_app_store_web_preview, analytics_app_store_preorders
+
+Notes:
+  - Subscription tables return HTTP 400 if account has no subscriptions (silently skipped)
+  - Analytics ONGOING requests take 24-48h to generate first data after first run
+  - Sales data available next day; Finance monthly after Apple closes the period
 """
 
-import os, json, gzip, jwt, time, io, csv, logging, requests
+import os, json, gzip, time, io, csv, logging, requests
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
 from google.oauth2 import service_account
+import jwt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-APPLE_KEY_ID         = os.environ["APPLE_KEY_ID"]
-APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"]
-APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"]
-APPLE_VENDOR_NUMBER  = os.environ["APPLE_VENDOR_NUMBER"]
-GCP_PROJECT          = os.environ["GCP_PROJECT"]
+APPLE_KEY_ID         = os.environ["APPLE_KEY_ID"].strip()
+APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"].strip()
+APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip()
+APPLE_VENDOR_NUMBER  = os.environ["APPLE_VENDOR_NUMBER"].strip()
+GCP_PROJECT          = os.environ["GCP_PROJECT"].strip()
 BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_store_data")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
-
 SALES_LOOKBACK_DAYS     = int(os.environ.get("SALES_LOOKBACK_DAYS", "7"))
 FINANCE_LOOKBACK_MONTHS = int(os.environ.get("FINANCE_LOOKBACK_MONTHS", "3"))
 
@@ -72,34 +77,38 @@ def now_ts():
 def parse_date(s):
     if not s: return None
     s = str(s).strip()
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d", "%Y-%m-%dT%H:%M:%S"):
-        try: return datetime.strptime(s[:10], fmt[:len(s[:10])]).strftime("%Y-%m-%d")
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d"):
+        try: return datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
         except: pass
     return s[:10] if len(s) >= 10 else s
 
 def tsv_rows(gz_bytes):
-    """Decompress gzipped TSV bytes and return list of dicts."""
-    with gzip.open(io.BytesIO(gz_bytes)) as gz:
-        content = gz.read().decode("utf-8")
-    return list(csv.DictReader(io.StringIO(content), delimiter="\t"))
+    try:
+        with gzip.open(io.BytesIO(gz_bytes)) as gz:
+            content = gz.read().decode("utf-8")
+        return list(csv.DictReader(io.StringIO(content), delimiter="\t"))
+    except Exception as e:
+        log.warning(f"  TSV parse error: {e}")
+        return []
 
 # ─── SCHEMAS ──────────────────────────────────────────────────────────────────
 S = bigquery.SchemaField
 
 SCHEMAS = {
-    # ── Sales Reports ─────────────────────────────────────────────────────────
     "sales_daily": [
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
         S("developer","STRING"), S("title","STRING"), S("version","STRING"),
         S("product_type_id","STRING"), S("units","FLOAT"), S("developer_proceeds","FLOAT"),
-        S("begins_period","DATE"), S("ends_period","DATE"), S("customer_currency","STRING"),
-        S("country_code","STRING"), S("currency_of_proceeds","STRING"),
-        S("apple_identifier","STRING"), S("customer_price","FLOAT"),
-        S("promo_code","STRING"), S("parent_identifier","STRING"),
-        S("subscription","STRING"), S("period","STRING"), S("category","STRING"),
-        S("cmb","STRING"), S("device","STRING"), S("supported_platforms","STRING"),
+        S("begins_period","DATE"), S("ends_period","DATE"),
+        S("customer_currency","STRING"), S("country_code","STRING"),
+        S("currency_of_proceeds","STRING"), S("apple_identifier","STRING"),
+        S("customer_price","FLOAT"), S("promo_code","STRING"),
+        S("parent_identifier","STRING"), S("subscription","STRING"),
+        S("period","STRING"), S("category","STRING"), S("cmb","STRING"),
+        S("device","STRING"), S("supported_platforms","STRING"),
         S("proceeds_reason","STRING"), S("preserved_pricing","STRING"),
-        S("client","STRING"), S("order_type","STRING"), S("_ingested_at","TIMESTAMP"),
+        S("client","STRING"), S("order_type","STRING"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "subscription_daily": [
         S("app_name","STRING"), S("app_apple_id","STRING"),
@@ -119,7 +128,8 @@ SCHEMAS = {
         S("free_trial_offer_code_subscriptions","FLOAT"),
         S("pay_as_you_go_offer_code_subscriptions","FLOAT"),
         S("pay_up_front_offer_code_subscriptions","FLOAT"),
-        S("marketing_opt_ins","FLOAT"), S("_ingested_at","TIMESTAMP"),
+        S("marketing_opt_ins","FLOAT"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "subscription_event_daily": [
         S("event_date","DATE"), S("event","STRING"),
@@ -130,7 +140,8 @@ SCHEMAS = {
         S("marketing_opt_in","STRING"), S("country","STRING"),
         S("state","STRING"), S("proceeds_reason","STRING"),
         S("preserved_pricing","STRING"), S("client","STRING"),
-        S("device","STRING"), S("quantity","FLOAT"), S("_ingested_at","TIMESTAMP"),
+        S("device","STRING"), S("quantity","FLOAT"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "subscriber_daily": [
         S("event_date","DATE"), S("app_name","STRING"), S("app_apple_id","STRING"),
@@ -138,9 +149,9 @@ SCHEMAS = {
         S("subscription_group_id","STRING"), S("standard_subscription_duration","STRING"),
         S("customer_price","FLOAT"), S("customer_currency","STRING"),
         S("developer_proceeds","FLOAT"), S("proceeds_currency","STRING"),
-        S("country","STRING"), S("quantity","FLOAT"), S("_ingested_at","TIMESTAMP"),
+        S("country","STRING"), S("quantity","FLOAT"),
+        S("_ingested_at","TIMESTAMP"),
     ],
-    # ── Finance Reports ───────────────────────────────────────────────────────
     "finance_monthly": [
         S("report_month","STRING"), S("start_date","DATE"), S("end_date","DATE"),
         S("vendor_identifier","STRING"), S("quantity","FLOAT"),
@@ -152,42 +163,44 @@ SCHEMAS = {
         S("ends_period","STRING"), S("customer_price","FLOAT"),
         S("customer_currency","STRING"), S("country_of_sale","STRING"),
         S("proceeds_reason","STRING"), S("preserved_pricing","STRING"),
-        S("parent_identifier","STRING"), S("_ingested_at","TIMESTAMP"),
+        S("parent_identifier","STRING"),
+        S("_ingested_at","TIMESTAMP"),
     ],
-    # ── Analytics ─────────────────────────────────────────────────────────────
     "analytics_sessions": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("sessions","INTEGER"), S("active_devices","INTEGER"),
         S("average_session_duration_seconds","FLOAT"),
-        S("source_type","STRING"), S("device","STRING"), S("platform_version","STRING"),
-        S("_ingested_at","TIMESTAMP"),
+        S("source_type","STRING"), S("device","STRING"),
+        S("platform_version","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_installs": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("installations","INTEGER"), S("first_time_downloads","INTEGER"),
         S("redownloads","INTEGER"), S("deletions","INTEGER"),
-        S("source_type","STRING"), S("device","STRING"), S("platform_version","STRING"),
-        S("territory","STRING"), S("_ingested_at","TIMESTAMP"),
+        S("source_type","STRING"), S("device","STRING"),
+        S("platform_version","STRING"), S("territory","STRING"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_crashes": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("crashes","INTEGER"), S("crash_rate","FLOAT"),
-        S("app_version","STRING"), S("device","STRING"), S("platform_version","STRING"),
-        S("_ingested_at","TIMESTAMP"),
+        S("app_version","STRING"), S("device","STRING"),
+        S("platform_version","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_app_store_discovery": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("impressions","INTEGER"), S("impressions_unique_device","INTEGER"),
         S("page_views","INTEGER"), S("page_views_unique_device","INTEGER"),
-        S("taps","INTEGER"),
-        S("source_type","STRING"), S("page_type","STRING"), S("event_type","STRING"),
-        S("territory","STRING"), S("device","STRING"), S("_ingested_at","TIMESTAMP"),
+        S("taps","INTEGER"), S("source_type","STRING"),
+        S("page_type","STRING"), S("event_type","STRING"),
+        S("territory","STRING"), S("device","STRING"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_app_store_downloads": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("total_downloads","INTEGER"), S("first_time_downloads","INTEGER"),
-        S("redownloads","INTEGER"),
-        S("source_type","STRING"), S("territory","STRING"), S("device","STRING"),
+        S("redownloads","INTEGER"), S("source_type","STRING"),
+        S("territory","STRING"), S("device","STRING"),
         S("platform_version","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_app_store_purchases": [
@@ -195,8 +208,8 @@ SCHEMAS = {
         S("purchases","INTEGER"), S("paying_users","INTEGER"),
         S("proceeds","FLOAT"), S("proceeds_currency","STRING"),
         S("purchase_type","STRING"), S("content_name","STRING"),
-        S("source_type","STRING"), S("territory","STRING"), S("device","STRING"),
-        S("_ingested_at","TIMESTAMP"),
+        S("source_type","STRING"), S("territory","STRING"),
+        S("device","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_subscription_state": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
@@ -205,35 +218,35 @@ SCHEMAS = {
         S("paid_subscriptions","INTEGER"), S("free_trials","INTEGER"),
         S("paid_offers","INTEGER"), S("billing_retry","INTEGER"),
         S("grace_period","INTEGER"), S("voluntary_churn","INTEGER"),
-        S("involuntary_churn","INTEGER"),
-        S("source_type","STRING"), S("territory","STRING"), S("device","STRING"),
+        S("involuntary_churn","INTEGER"), S("source_type","STRING"),
+        S("territory","STRING"), S("device","STRING"),
         S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_app_store_web_preview": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
-        S("impressions","INTEGER"), S("page_views","INTEGER"), S("taps","INTEGER"),
-        S("source_type","STRING"), S("page_type","STRING"),
-        S("territory","STRING"), S("_ingested_at","TIMESTAMP"),
+        S("impressions","INTEGER"), S("page_views","INTEGER"),
+        S("taps","INTEGER"), S("source_type","STRING"),
+        S("page_type","STRING"), S("territory","STRING"),
+        S("_ingested_at","TIMESTAMP"),
     ],
     "analytics_app_store_preorders": [
         S("date","DATE"), S("app_id","STRING"), S("app_name","STRING"),
         S("preorders","INTEGER"), S("canceled_preorders","INTEGER"),
-        S("source_type","STRING"), S("territory","STRING"), S("device","STRING"),
-        S("_ingested_at","TIMESTAMP"),
+        S("source_type","STRING"), S("territory","STRING"),
+        S("device","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
 }
 
-# Report name → table name mapping for analytics
 ANALYTICS_REPORT_MAP = {
-    "App Sessions":                    "analytics_sessions",
-    "App Installations and Deletions": "analytics_installs",
-    "App Crashes":                     "analytics_crashes",
+    "App Sessions":                       "analytics_sessions",
+    "App Installations and Deletions":    "analytics_installs",
+    "App Crashes":                        "analytics_crashes",
     "App Store Discovery and Engagement": "analytics_app_store_discovery",
-    "App Store Downloads":             "analytics_app_store_downloads",
-    "App Store Purchases":             "analytics_app_store_purchases",
-    "Subscription State":              "analytics_subscription_state",
-    "App Store Web Preview":           "analytics_app_store_web_preview",
-    "App Store Pre-orders":            "analytics_app_store_preorders",
+    "App Store Downloads":                "analytics_app_store_downloads",
+    "App Store Purchases":                "analytics_app_store_purchases",
+    "Subscription State":                 "analytics_subscription_state",
+    "App Store Web Preview":              "analytics_app_store_web_preview",
+    "App Store Pre-orders":               "analytics_app_store_preorders",
 }
 
 # ─── SALES REPORTS ────────────────────────────────────────────────────────────
@@ -251,7 +264,7 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
         if resp.status_code == 200:
             return tsv_rows(resp.content)
         elif resp.status_code in (400, 404):
-            return []  # No data or not applicable for this account
+            return []  # No data or report type not applicable for this account
         else:
             log.warning(f"  {report_type}/{report_date}: HTTP {resp.status_code}")
             return []
@@ -264,17 +277,17 @@ def fetch_sales_daily():
     rows = []
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
-    current = start
-    done = 0
-    total = (end - start).days + 1
+    current, done, total = start, 0, (end - start).days + 1
     while current <= end:
         for r in get_sales_report("SALES", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                "provider": r.get("Provider"), "provider_country": r.get("Provider Country"),
+                "provider": r.get("Provider"),
+                "provider_country": r.get("Provider Country"),
                 "sku": r.get("SKU"), "developer": r.get("Developer"),
                 "title": r.get("Title"), "version": r.get("Version"),
                 "product_type_id": r.get("Product Type Identifier"),
-                "units": sf(r.get("Units")), "developer_proceeds": sf(r.get("Developer Proceeds")),
+                "units": sf(r.get("Units")),
+                "developer_proceeds": sf(r.get("Developer Proceeds")),
                 "begins_period": parse_date(r.get("Begin Date")),
                 "ends_period": parse_date(r.get("End Date")),
                 "customer_currency": r.get("Customer Currency"),
@@ -282,10 +295,12 @@ def fetch_sales_daily():
                 "currency_of_proceeds": r.get("Currency of Proceeds"),
                 "apple_identifier": r.get("Apple Identifier"),
                 "customer_price": sf(r.get("Customer Price")),
-                "promo_code": r.get("Promo Code"), "parent_identifier": r.get("Parent Identifier"),
-                "subscription": r.get("Subscription"), "period": r.get("Period"),
-                "category": r.get("Category"), "cmb": r.get("CMB"),
-                "device": r.get("Device"), "supported_platforms": r.get("Supported Platforms"),
+                "promo_code": r.get("Promo Code"),
+                "parent_identifier": r.get("Parent Identifier"),
+                "subscription": r.get("Subscription"),
+                "period": r.get("Period"), "category": r.get("Category"),
+                "cmb": r.get("CMB"), "device": r.get("Device"),
+                "supported_platforms": r.get("Supported Platforms"),
                 "proceeds_reason": r.get("Proceeds Reason"),
                 "preserved_pricing": r.get("Preserved Pricing"),
                 "client": r.get("Client"), "order_type": r.get("Order Type"),
@@ -359,7 +374,8 @@ def fetch_subscription_event_daily():
                 "proceeds_reason": r.get("Proceeds Reason"),
                 "preserved_pricing": r.get("Preserved Pricing"),
                 "client": r.get("Client"), "device": r.get("Device"),
-                "quantity": sf(r.get("Quantity")), "_ingested_at": now_ts(),
+                "quantity": sf(r.get("Quantity")),
+                "_ingested_at": now_ts(),
             })
         current += timedelta(days=1)
     log.info(f"  ✓ subscription_event_daily: {len(rows)} rows")
@@ -384,7 +400,8 @@ def fetch_subscriber_daily():
                 "customer_currency": r.get("Customer Currency"),
                 "developer_proceeds": sf(r.get("Developer Proceeds")),
                 "proceeds_currency": r.get("Proceeds Currency"),
-                "country": r.get("Country"), "quantity": sf(r.get("Quantity")),
+                "country": r.get("Country"),
+                "quantity": sf(r.get("Quantity")),
                 "_ingested_at": now_ts(),
             })
         current += timedelta(days=1)
@@ -436,6 +453,10 @@ def fetch_finance_monthly():
                         "_ingested_at": now_ts(),
                     })
                 if rows: log.info(f"  Finance {report_date}: ok")
+            elif resp.status_code in (400, 404):
+                pass  # No data this month
+            else:
+                log.warning(f"  Finance {report_date}: HTTP {resp.status_code}")
         except Exception as e:
             log.warning(f"  Finance {report_date}: {e}")
     log.info(f"  ✓ finance_monthly: {len(rows)} rows")
@@ -459,21 +480,19 @@ def get_all_apps():
     log.info(f"  Found {len(apps)} apps")
     return apps
 
-def ensure_analytics_request(app_id, access_type="ONGOING"):
-    """Get existing or create new analytics report request."""
+def ensure_analytics_request(app_id):
     try:
         resp = requests.get(
             f"{BASE_URL}/apps/{app_id}/analyticsReportRequests",
-            params={"filter[accessType]": access_type},
+            params={"filter[accessType]": "ONGOING"},
             headers=auth(), timeout=30
         )
         existing = resp.json().get("data", [])
         if existing:
             return existing[0]["id"]
-        # Create new
         payload = {"data": {
             "type": "analyticsReportRequests",
-            "attributes": {"accessType": access_type},
+            "attributes": {"accessType": "ONGOING"},
             "relationships": {"app": {"data": {"type": "apps", "id": app_id}}}
         }}
         resp2 = requests.post(f"{BASE_URL}/analyticsReportRequests",
@@ -484,10 +503,9 @@ def ensure_analytics_request(app_id, access_type="ONGOING"):
         log.warning(f"  Analytics request error for {app_id}: {e}")
     return None
 
-def parse_analytics_row(r, table_name, app_id, app_name):
-    """Map raw analytics TSV row to BQ row based on table."""
+def parse_analytics_row(r, table_name, app_id, app_name, proc_date):
     base = {
-        "date":     parse_date(r.get("Date") or r.get("date") or r.get("Processing Date")),
+        "date":     parse_date(r.get("Date") or r.get("date") or proc_date),
         "app_id":   app_id,
         "app_name": app_name,
         "_ingested_at": now_ts(),
@@ -578,23 +596,15 @@ def parse_analytics_row(r, table_name, app_id, app_name):
     return base
 
 def fetch_all_analytics(apps):
-    """Fetch all 9 analytics report types for all apps."""
-    log.info(f"Fetching Analytics for {len(apps)} apps ({len(ANALYTICS_REPORT_MAP)} report types each)...")
-
-    # Initialize empty lists for all tables
+    log.info(f"Fetching Analytics for {len(apps)} apps...")
     results = {t: [] for t in ANALYTICS_REPORT_MAP.values()}
 
     for app in apps:
-        app_id   = app["id"]
-        app_name = app["name"]
-
-        # Ensure ONGOING request exists
-        request_id = ensure_analytics_request(app_id, "ONGOING")
+        app_id, app_name = app["id"], app["name"]
+        request_id = ensure_analytics_request(app_id)
         if not request_id:
-            log.warning(f"  No analytics request for {app_name}")
             continue
 
-        # Get all available reports for this request
         try:
             resp = requests.get(
                 f"{BASE_URL}/analyticsReportRequests/{request_id}/reports",
@@ -608,9 +618,7 @@ def fetch_all_analytics(apps):
         for report in reports:
             report_id   = report["id"]
             report_name = report["attributes"].get("name", "")
-
-            # Match to our known tables
-            table_name = None
+            table_name  = None
             for key, tbl in ANALYTICS_REPORT_MAP.items():
                 if key.lower() in report_name.lower():
                     table_name = tbl
@@ -618,7 +626,6 @@ def fetch_all_analytics(apps):
             if not table_name:
                 continue
 
-            # Get daily instances
             try:
                 resp = requests.get(
                     f"{BASE_URL}/analyticsReports/{report_id}/instances",
@@ -626,15 +633,12 @@ def fetch_all_analytics(apps):
                     headers=auth(), timeout=30
                 )
                 instances = resp.json().get("data", [])
-            except Exception as e:
-                log.warning(f"  Instances error {report_name}: {e}")
+            except:
                 continue
 
             for instance in instances:
                 instance_id = instance["id"]
                 proc_date   = instance["attributes"].get("processingDate", "")
-
-                # Get download segments
                 try:
                     resp = requests.get(
                         f"{BASE_URL}/analyticsReportInstances/{instance_id}/segments",
@@ -649,20 +653,15 @@ def fetch_all_analytics(apps):
                     if not dl_url:
                         continue
                     try:
-                        dl_resp = requests.get(dl_url, timeout=120)
-                        if dl_resp.status_code == 200:
-                            seg_rows = tsv_rows(dl_resp.content)
-                            for r in seg_rows:
-                                if not r.get("Date") and not r.get("date"):
-                                    r["Date"] = proc_date
-                                parsed = parse_analytics_row(r, table_name, app_id, app_name)
+                        dl = requests.get(dl_url, timeout=120)
+                        if dl.status_code == 200:
+                            for r in tsv_rows(dl.content):
+                                parsed = parse_analytics_row(r, table_name, app_id, app_name, proc_date)
                                 results[table_name].append(parsed)
-                    except Exception as e:
-                        log.warning(f"  Download error {dl_url[:60]}: {e}")
+                    except:
+                        pass
 
-            time.sleep(0.15)  # gentle rate limiting
-
-        log.info(f"  Done {app_name}: {sum(len(v) for v in results.values())} total rows so far")
+        time.sleep(0.2)
 
     for tbl, rows in results.items():
         log.info(f"  ✓ {tbl}: {len(rows)} rows")
@@ -699,7 +698,7 @@ def load_to_bq(bq, name, rows):
             e = bq.insert_rows_json(ref, rows[i:i+500])
             if e: errs.extend(e[:2])
         except Exception as e:
-            log.error(f"  Batch {i} error: {e}")
+            log.error(f"  Batch error: {e}")
     if errs:
         log.error(f"BQ errors [{name}]: {errs[:2]}")
     else:
@@ -734,7 +733,7 @@ def main():
     else:
         log.warning("  No apps found — skipping analytics")
 
-    log.info("✅ Apple App Store Connect sync complete! 14 tables loaded.")
+    log.info("✅ Apple App Store Connect sync complete! 14 tables.")
 
 if __name__ == "__main__":
     main()
