@@ -734,6 +734,27 @@ def fetch_all_analytics(apps):
     return results
 
 # ─── BIGQUERY ─────────────────────────────────────────────────────────────────
+def dedup_rows(rows, key_fields):
+    """Deduplicate rows by key fields — keeps last occurrence."""
+    seen = {}
+    for r in rows:
+        key = tuple(r.get(f) for f in key_fields)
+        seen[key] = r
+    return list(seen.values())
+
+# Key fields for deduplicating each analytics table
+ANALYTICS_DEDUP_KEYS = {
+    "analytics_sessions":              ["date", "app_id", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
+    "analytics_installs":              ["date", "app_id", "event", "download_type", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
+    "analytics_app_store_discovery":   ["date", "app_id", "event", "page_type", "source_type", "engagement_type", "device", "platform_version", "territory"],
+    "analytics_app_store_downloads":   ["date", "app_id", "download_type", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
+    "analytics_app_store_purchases":   ["date", "app_id", "purchase_type", "content_name", "device", "platform_version", "source_type", "page_type", "territory"],
+    "analytics_subscription_state":    ["date", "app_id", "subscription_name", "source_type", "territory", "device"],
+    "analytics_app_store_web_preview": ["date", "app_id", "page_type", "source_type", "territory"],
+    "analytics_app_store_preorders":   ["date", "app_id", "source_type", "territory", "device"],
+    "analytics_crashes":               ["date", "app_id", "app_version", "device", "platform_version"],
+}
+
 def get_bq():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GCP_CREDENTIALS_JSON),
@@ -833,6 +854,13 @@ def main():
                 continue
             # FIX v2: Delete date range found in fetched data before loading
             dates = [r.get("date") for r in rows if r.get("date")]
+            # Deduplicate rows before loading — Apple can return duplicate segments
+            key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
+            if key_fields:
+                before = len(rows)
+                rows = dedup_rows(rows, key_fields)
+                if len(rows) < before:
+                    log.info(f"  Deduped {table_name}: {before} → {len(rows)} rows")
             if dates:
                 min_d, max_d = min(dates), max(dates)
                 analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"
