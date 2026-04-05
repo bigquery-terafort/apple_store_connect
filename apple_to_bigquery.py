@@ -664,7 +664,6 @@ def fetch_all_analytics(apps):
         for report in reports:
             report_id   = report["id"]
             report_name = report["attributes"].get("name", "")
-            log.info(f"  Apple report name: '{report_name}' (app: {app_name})")
             table_name  = None
             for key, tbl in ANALYTICS_REPORT_MAP.items():
                 if key.lower() in report_name.lower():
