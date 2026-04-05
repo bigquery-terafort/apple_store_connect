@@ -701,7 +701,10 @@ def fetch_all_analytics(apps):
                     try:
                         dl = requests.get(dl_url, timeout=120)
                         if dl.status_code == 200:
-                            for r in tsv_rows(dl.content):
+                            raw_rows = tsv_rows(dl.content)
+                            if raw_rows and not results[table_name]:
+                                log.info(f"  [{table_name}] columns: {list(raw_rows[0].keys())}")
+                            for r in raw_rows:
                                 parsed = parse_analytics_row(r, table_name, app_id, app_name, proc_date)
                                 results[table_name].append(parsed)
                     except:
