@@ -250,15 +250,16 @@ SCHEMAS = {
 }
 
 ANALYTICS_REPORT_MAP = {
-    "App Sessions":                       "analytics_sessions",
-    "App Installations and Deletions":    "analytics_installs",
-    "App Crashes":                        "analytics_crashes",
-    "App Store Discovery and Engagement": "analytics_app_store_discovery",
-    "App Store Downloads":                "analytics_app_store_downloads",
-    "App Store Purchases":                "analytics_app_store_purchases",
-    "Subscription State":                 "analytics_subscription_state",
-    "App Store Web Preview":              "analytics_app_store_web_preview",
-    "App Store Pre-orders":               "analytics_app_store_preorders",
+    # Confirmed from Apple API log — exact substring matches against report names
+    "App Sessions Standard":                       "analytics_sessions",
+    "App Store Installation and Deletion Standard": "analytics_installs",
+    "App Crashes":                                  "analytics_crashes",
+    "App Store Discovery and Engagement Standard":  "analytics_app_store_discovery",
+    "App Downloads Standard":                       "analytics_app_store_downloads",
+    "App Store Purchases Standard":                 "analytics_app_store_purchases",
+    "Subscription State":                           "analytics_subscription_state",
+    "App Store Web Preview":                        "analytics_app_store_web_preview",
+    "App Store Pre-Orders Standard":                "analytics_app_store_preorders",
 }
 
 # Tables with a "date" column — delete by date range before insert
