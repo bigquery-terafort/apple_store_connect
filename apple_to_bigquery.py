@@ -1,6 +1,13 @@
 """
-Apple App Store Connect → BigQuery  ·  COMPLETE FINAL PIPELINE
-=============================================================
+Apple App Store Connect → BigQuery  ·  COMPLETE PIPELINE v2
+============================================================
+Fixes vs v1:
+  1. Replaced insert_rows_json (streaming) with load_table_from_json (batch load jobs)
+  2. Delete-before-insert for all sales/analytics tables by date range
+  3. Finance monthly: delete by report_month before loading
+  4. subscription_daily: added date column to schema and fetch function
+  5. Analytics: track min/max date in fetched data and delete that range before load
+
 Auth: JWT (ES256), auto-refreshed every 20 minutes
 
 Tables (14):
@@ -10,12 +17,6 @@ Tables (14):
                  analytics_app_store_discovery, analytics_app_store_downloads,
                  analytics_app_store_purchases, analytics_subscription_state,
                  analytics_app_store_web_preview, analytics_app_store_preorders
-
-Notes:
-  - Subscription tables return HTTP 400 if account has no subscriptions (silently skipped)
-  - Analytics ONGOING requests take 24-48h to generate first data after first run
-  - Sales data available next day; Finance monthly after Apple closes the period
-  - Finance TSV footer/summary rows are filtered out (non-date Start Date values)
 """
 
 import os, re, json, gzip, time, io, csv, logging, requests
@@ -31,7 +32,7 @@ log = logging.getLogger(__name__)
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 APPLE_KEY_ID         = os.environ["APPLE_KEY_ID"].strip()
 APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"].strip()
-APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip()
+APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip().replace("\\n", "\n")
 APPLE_VENDOR_NUMBER  = os.environ["APPLE_VENDOR_NUMBER"].strip()
 GCP_PROJECT          = os.environ["GCP_PROJECT"].strip()
 BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_store_data")
@@ -41,7 +42,7 @@ FINANCE_LOOKBACK_MONTHS = int(os.environ.get("FINANCE_LOOKBACK_MONTHS", "3"))
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
 
-# ─── JWT AUTH ────────────────────────────────────────────────────────────────
+# ─── JWT AUTH ─────────────────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
 
 def get_jwt():
@@ -95,10 +96,16 @@ def tsv_rows(gz_bytes):
         log.warning(f"  TSV parse error: {e}")
         return []
 
+def get_sales_date_range():
+    end   = date.today() - timedelta(days=1)
+    start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
+    return start, end
+
 # ─── SCHEMAS ─────────────────────────────────────────────────────────────────
 S = bigquery.SchemaField
 SCHEMAS = {
     "sales_daily": [
+        S("date","DATE"),  # report date — the date we fetched this report for
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
         S("developer","STRING"), S("title","STRING"), S("version","STRING"),
         S("product_type_id","STRING"), S("units","FLOAT"), S("developer_proceeds","FLOAT"),
@@ -114,6 +121,8 @@ SCHEMAS = {
         S("_ingested_at","TIMESTAMP"),
     ],
     "subscription_daily": [
+        # FIX v2: Added date column — was missing, impossible to dedup without it
+        S("date","DATE"),
         S("app_name","STRING"), S("app_apple_id","STRING"),
         S("subscription_name","STRING"), S("subscription_apple_id","STRING"),
         S("subscription_group_id","STRING"), S("standard_subscription_duration","STRING"),
@@ -252,6 +261,35 @@ ANALYTICS_REPORT_MAP = {
     "App Store Pre-orders":               "analytics_app_store_preorders",
 }
 
+# Tables with a "date" column — delete by date range before insert
+DATE_TABLES = {
+    "sales_daily",
+    "subscription_daily",
+    "subscription_event_daily",
+    "subscriber_daily",
+    "analytics_sessions", "analytics_installs", "analytics_crashes",
+    "analytics_app_store_discovery", "analytics_app_store_downloads",
+    "analytics_app_store_purchases", "analytics_subscription_state",
+    "analytics_app_store_web_preview", "analytics_app_store_preorders",
+}
+
+# Date column name per table
+DATE_COL = {
+    "sales_daily":                      "begins_period",
+    "subscription_daily":               "date",
+    "subscription_event_daily":         "event_date",
+    "subscriber_daily":                 "event_date",
+    "analytics_sessions":               "date",
+    "analytics_installs":               "date",
+    "analytics_crashes":                "date",
+    "analytics_app_store_discovery":    "date",
+    "analytics_app_store_downloads":    "date",
+    "analytics_app_store_purchases":    "date",
+    "analytics_subscription_state":     "date",
+    "analytics_app_store_web_preview":  "date",
+    "analytics_app_store_preorders":    "date",
+}
+
 # ─── SALES REPORTS ───────────────────────────────────────────────────────────
 def get_sales_report(report_type, report_subtype, frequency, report_date):
     params = {
@@ -267,7 +305,7 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
         if resp.status_code == 200:
             return tsv_rows(resp.content)
         elif resp.status_code in (400, 404):
-            return []  # No data or report type not applicable for this account
+            return []
         else:
             log.warning(f"  {report_type}/{report_date}: HTTP {resp.status_code}")
             return []
@@ -278,12 +316,12 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
 def fetch_sales_daily():
     log.info("Fetching Sales Daily...")
     rows = []
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
+    start, end = get_sales_date_range()
     current, done, total = start, 0, (end - start).days + 1
     while current <= end:
         for r in get_sales_report("SALES", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
+                "date":               current.strftime("%Y-%m-%d"),  # report date
                 "provider": r.get("Provider"),
                 "provider_country": r.get("Provider Country"),
                 "sku": r.get("SKU"), "developer": r.get("Developer"),
@@ -318,12 +356,13 @@ def fetch_sales_daily():
 def fetch_subscription_daily():
     log.info("Fetching Subscription Daily...")
     rows = []
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
+    start, end = get_sales_date_range()
     current = start
     while current <= end:
         for r in get_sales_report("SUBSCRIPTION", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
+                # FIX v2: date field added — was missing in v1
+                "date": str(current),
                 "app_name": r.get("App Name"), "app_apple_id": r.get("App Apple ID"),
                 "subscription_name": r.get("Subscription Name"),
                 "subscription_apple_id": r.get("Subscription Apple ID"),
@@ -357,8 +396,7 @@ def fetch_subscription_daily():
 def fetch_subscription_event_daily():
     log.info("Fetching Subscription Event Daily...")
     rows = []
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
+    start, end = get_sales_date_range()
     current = start
     while current <= end:
         for r in get_sales_report("SUBSCRIPTION_EVENT", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
@@ -387,8 +425,7 @@ def fetch_subscription_event_daily():
 def fetch_subscriber_daily():
     log.info("Fetching Subscriber Daily...")
     rows = []
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=SALES_LOOKBACK_DAYS - 1)
+    start, end = get_sales_date_range()
     current = start
     while current <= end:
         for r in get_sales_report("SUBSCRIBER", "DETAILED", "DAILY", current.strftime("%Y-%m-%d")):
@@ -411,7 +448,7 @@ def fetch_subscriber_daily():
     log.info(f"  ✓ subscriber_daily: {len(rows)} rows")
     return rows
 
-# ─── FINANCE REPORTS ─────────────────────────────────────────────────────────
+# ─── FINANCE REPORTS ──────────────────────────────────────────────────────────
 def fetch_finance_monthly():
     log.info("Fetching Finance Monthly...")
     rows = []
@@ -431,7 +468,6 @@ def fetch_finance_monthly():
             if resp.status_code == 200:
                 month_rows = 0
                 for r in tsv_rows(resp.content):
-                    # Skip Apple-appended footer/summary rows (non-date Start Date values)
                     raw_start = parse_date(r.get("Start Date"))
                     if not is_valid_date(raw_start):
                         continue
@@ -463,7 +499,7 @@ def fetch_finance_monthly():
                     month_rows += 1
                 if month_rows: log.info(f"  Finance {report_date}: {month_rows} rows")
             elif resp.status_code in (400, 404):
-                pass  # No data this month
+                pass
             else:
                 log.warning(f"  Finance {report_date}: HTTP {resp.status_code}")
         except Exception as e:
@@ -471,7 +507,7 @@ def fetch_finance_monthly():
     log.info(f"  ✓ finance_monthly: {len(rows)} rows")
     return rows
 
-# ─── ANALYTICS ───────────────────────────────────────────────────────────────
+# ─── ANALYTICS ────────────────────────────────────────────────────────────────
 def get_all_apps():
     apps, url = [], f"{BASE_URL}/apps"
     params = {"limit": 200}
@@ -676,7 +712,7 @@ def fetch_all_analytics(apps):
         log.info(f"  ✓ {tbl}: {len(rows)} rows")
     return results
 
-# ─── BIGQUERY ────────────────────────────────────────────────────────────────
+# ─── BIGQUERY ─────────────────────────────────────────────────────────────────
 def get_bq():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GCP_CREDENTIALS_JSON),
@@ -696,26 +732,40 @@ def ensure_table(bq, name):
         log.info(f"Creating table {name}")
         bq.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
-def load_to_bq(bq, name, rows):
+def load_to_bq(bq, name, rows, delete_filter=None):
+    """
+    FIX v2: Batch load jobs — no streaming buffer.
+    delete_filter: SQL WHERE clause string for clearing existing data.
+    """
     if not rows:
         log.info(f"  No rows for {name}")
         return
-    ref  = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
-    errs = []
-    for i in range(0, len(rows), 500):
-        try:
-            e = bq.insert_rows_json(ref, rows[i:i+500])
-            if e: errs.extend(e[:2])
-        except Exception as e:
-            log.error(f"  Batch error: {e}")
-    if errs:
-        log.error(f"BQ errors [{name}]: {errs[:2]}")
-    else:
-        log.info(f"  ✅ {len(rows):,} rows → {name}")
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+    table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
+
+    # Step 1: Delete existing data
+    if delete_filter:
+        try:
+            bq.query(f"DELETE FROM `{table_ref}` WHERE {delete_filter}").result()
+            log.info(f"  Cleared {name} ({delete_filter})")
+        except Exception as e:
+            log.warning(f"  Could not clear {name}: {e}")
+
+    # Step 2: Batch load job
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=SCHEMAS[name],
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        load_job = bq.load_table_from_json(rows, table_ref, job_config=job_config)
+        load_job.result()
+        log.info(f"  ✅ {len(rows):,} rows → {name}")
+    except Exception as e:
+        log.error(f"  Load job failed [{name}]: {e}")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🍎 Apple App Store Connect → BigQuery  (14 tables)")
+    log.info("🍎 Apple App Store Connect → BigQuery v2 (14 tables)")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
     log.info(f"   Finance lookback: {FINANCE_LOOKBACK_MONTHS} months")
 
@@ -724,25 +774,54 @@ def main():
     for t in SCHEMAS:
         ensure_table(bq, t)
 
+    start, end = get_sales_date_range()
+    sales_filter = f"date BETWEEN '{start}' AND '{end}'"  # report date column
+    sub_filter   = f"date BETWEEN '{start}' AND '{end}'"
+    evt_filter   = f"event_date BETWEEN '{start}' AND '{end}'"
+
     log.info("── Sales Reports ──")
-    load_to_bq(bq, "sales_daily",              fetch_sales_daily())
-    load_to_bq(bq, "subscription_daily",       fetch_subscription_daily())
-    load_to_bq(bq, "subscription_event_daily", fetch_subscription_event_daily())
-    load_to_bq(bq, "subscriber_daily",         fetch_subscriber_daily())
+    load_to_bq(bq, "sales_daily",              fetch_sales_daily(),              sales_filter)
+    load_to_bq(bq, "subscription_daily",       fetch_subscription_daily(),       sub_filter)
+    load_to_bq(bq, "subscription_event_daily", fetch_subscription_event_daily(), evt_filter)
+    load_to_bq(bq, "subscriber_daily",         fetch_subscriber_daily(),         evt_filter)
 
     log.info("── Finance Reports ──")
-    load_to_bq(bq, "finance_monthly", fetch_finance_monthly())
+    finance_rows = fetch_finance_monthly()
+    # FIX v2: Delete by each report_month before loading — no duplicate months
+    today = date.today()
+    for i in range(1, FINANCE_LOOKBACK_MONTHS + 1):
+        report_month = (today - relativedelta(months=i)).strftime("%Y-%m")
+        try:
+            bq.query(
+                f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.finance_monthly` "
+                f"WHERE report_month = '{report_month}'"
+            ).result()
+            log.info(f"  Cleared finance_monthly for {report_month}")
+        except Exception as e:
+            log.warning(f"  Could not clear finance_monthly {report_month}: {e}")
+    # Load all finance rows in one batch
+    load_to_bq(bq, "finance_monthly", finance_rows)  # no delete_filter — already cleared above
 
     log.info("── Analytics Reports ──")
     apps = get_all_apps()
     if apps:
         analytics = fetch_all_analytics(apps)
         for table_name, rows in analytics.items():
-            load_to_bq(bq, table_name, rows)
+            if not rows:
+                log.info(f"  No rows for {table_name}")
+                continue
+            # FIX v2: Delete date range found in fetched data before loading
+            dates = [r.get("date") for r in rows if r.get("date")]
+            if dates:
+                min_d, max_d = min(dates), max(dates)
+                analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"
+                load_to_bq(bq, table_name, rows, analytics_filter)
+            else:
+                load_to_bq(bq, table_name, rows)
     else:
         log.warning("  No apps found — skipping analytics")
 
-    log.info("✅ Apple App Store Connect sync complete! 14 tables.")
+    log.info("✅ Apple App Store Connect sync v2 complete! 14 tables.")
 
 if __name__ == "__main__":
     main()
