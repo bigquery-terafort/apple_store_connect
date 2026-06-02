@@ -7,10 +7,10 @@ on:
     inputs:
       sales_lookback_days:
         description: "Days of sales history to fetch"
-        default: "7"
+        default: "21"
       finance_lookback_months:
         description: "Months of finance history to fetch"
-        default: "3"
+        default: "6"
 
 jobs:
   sync:
