@@ -1,12 +1,39 @@
 """
-Apple App Store Connect → BigQuery  ·  COMPLETE PIPELINE v2
+Apple App Store Connect → BigQuery  ·  COMPLETE PIPELINE v3
 ============================================================
-Fixes vs v1:
-  1. Replaced insert_rows_json (streaming) with load_table_from_json (batch load jobs)
-  2. Delete-before-insert for all sales/analytics tables by date range
-  3. Finance monthly: delete by report_month before loading
-  4. subscription_daily: added date column to schema and fetch function
-  5. Analytics: track min/max date in fetched data and delete that range before load
+⚠️  YE FILE DONO APPLE REPOS MEIN LAGTI HAI:
+        apple_store_connect          (BQ_DATASET=apple_store_data)
+        apple_console_terafort_us    (BQ_DATASET=apple_console_terafort_us)
+    Farq sirf env vars ka hai (vendor number + dataset).
+
+🔴 v3 KYUN — YE SCRIPT DATA KHA RAHI THI
+────────────────────────────────────────
+BigQuery se saabit nuqsan (analytics_app_store_downloads):
+    2026-01   31/31 din gayab
+    2026-02   28/28 din gayab
+    2026-03   29/31 din gayab
+    2026-05   31/31 din gayab
+    2026-06   18/30 din gayab   ← ye 2026-07-26 09:09 ke run mein hi uda
+
+ASLI BUG (v2 ke main() mein):
+    dates = [r.get("date") for r in rows if r.get("date")]
+    min_d, max_d = min(dates), max(dates)
+    analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"   # ← POORI RANGE
+    load_to_bq(bq, table_name, rows, analytics_filter)           # DELETE, phir insert
+
+  min_d..max_d us data se banta hai jo KAAMYABI se mila. Aur fetch chup-chaap
+  tootta rehta tha — chaar jagah bare `except: continue` / `except: pass`.
+  Nateeja: kuch apps ka data Jan se July tak phaila mila → DELETE ne Jan se
+  July tak SAB uda diya → sirf jo mila wo wapas dala. Har run thoda aur khaya.
+  Aur load fail ho to bhi sirf log.error — script `exit 0` deti thi.
+
+v3 KE FIX:
+  🛡️ 1. fetch ki har nakami GINI JATI hai (bare except khatam)
+  🛡️ 2. adhoora fetch → DELETE bilkul nahi, aur exit(1)
+  🛡️ 3. `BETWEEN min AND max` → `date IN (...)` — sirf wahi din jo AAYE hain
+  🛡️ 4. DELETE + INSERT atomic (staging + BEGIN TRANSACTION)
+  🛡️ 5. finance/sales bhi atomic
+  ✅ Baqi sab v2 jaisa: 14 tables, JWT auth, dedup keys, batch load jobs
 
 Auth: JWT (ES256), auto-refreshed every 20 minutes
 
@@ -19,7 +46,7 @@ Tables (14):
                  analytics_app_store_web_preview, analytics_app_store_preorders
 """
 
-import os, re, json, gzip, time, io, csv, logging, requests
+import os, re, json, gzip, time, io, csv, sys, logging, requests
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
@@ -67,11 +94,11 @@ def auth():
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def sf(v):
     try: return float(v) if v not in (None, "", "--", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def si(v):
     try: return int(float(v)) if v not in (None, "", "--", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def now_ts():
     return datetime.utcnow().isoformat()
@@ -81,7 +108,7 @@ def parse_date(s):
     s = str(s).strip()
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d"):
         try: return datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
-        except: pass
+        except Exception: pass
     return s[:10] if len(s) >= 10 else s
 
 def is_valid_date(s):
@@ -105,7 +132,7 @@ def get_sales_date_range():
 S = bigquery.SchemaField
 SCHEMAS = {
     "sales_daily": [
-        S("date","DATE"),  # report date — the date we fetched this report for
+        S("date","DATE"),
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
         S("developer","STRING"), S("title","STRING"), S("version","STRING"),
         S("product_type_id","STRING"), S("units","FLOAT"), S("developer_proceeds","FLOAT"),
@@ -121,7 +148,6 @@ SCHEMAS = {
         S("_ingested_at","TIMESTAMP"),
     ],
     "subscription_daily": [
-        # FIX v2: Added date column — was missing, impossible to dedup without it
         S("date","DATE"),
         S("app_name","STRING"), S("app_apple_id","STRING"),
         S("subscription_name","STRING"), S("subscription_apple_id","STRING"),
@@ -253,8 +279,7 @@ SCHEMAS = {
 }
 
 ANALYTICS_REPORT_MAP = {
-    # Confirmed from Apple API log — exact substring matches against report names
-    "App Sessions Standard":                       "analytics_sessions",
+    "App Sessions Standard":                        "analytics_sessions",
     "App Store Installation and Deletion Standard": "analytics_installs",
     "App Crashes":                                  "analytics_crashes",
     "App Store Discovery and Engagement Standard":  "analytics_app_store_discovery",
@@ -265,19 +290,14 @@ ANALYTICS_REPORT_MAP = {
     "App Store Pre-Orders Standard":                "analytics_app_store_preorders",
 }
 
-# Tables with a "date" column — delete by date range before insert
 DATE_TABLES = {
-    "sales_daily",
-    "subscription_daily",
-    "subscription_event_daily",
-    "subscriber_daily",
+    "sales_daily", "subscription_daily", "subscription_event_daily", "subscriber_daily",
     "analytics_sessions", "analytics_installs", "analytics_crashes",
     "analytics_app_store_discovery", "analytics_app_store_downloads",
     "analytics_app_store_purchases", "analytics_subscription_state",
     "analytics_app_store_web_preview", "analytics_app_store_preorders",
 }
 
-# Date column name per table
 DATE_COL = {
     "sales_daily":                      "begins_period",
     "subscription_daily":               "date",
@@ -309,7 +329,7 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
         if resp.status_code == 200:
             return tsv_rows(resp.content)
         elif resp.status_code in (400, 404):
-            return []
+            return []      # us din ka report maujood nahi — normal
         else:
             log.warning(f"  {report_type}/{report_date}: HTTP {resp.status_code}")
             return []
@@ -325,7 +345,7 @@ def fetch_sales_daily():
     while current <= end:
         for r in get_sales_report("SALES", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                "date":               current.strftime("%Y-%m-%d"),  # report date
+                "date":               current.strftime("%Y-%m-%d"),
                 "provider": r.get("Provider"),
                 "provider_country": r.get("Provider Country"),
                 "sku": r.get("SKU"), "developer": r.get("Developer"),
@@ -365,7 +385,6 @@ def fetch_subscription_daily():
     while current <= end:
         for r in get_sales_report("SUBSCRIPTION", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                # FIX v2: date field added — was missing in v1
                 "date": str(current),
                 "app_name": r.get("App Name"), "app_apple_id": r.get("App Apple ID"),
                 "subscription_name": r.get("Subscription Name"),
@@ -660,14 +679,18 @@ def parse_analytics_row(r, table_name, app_id, app_name, proc_date):
         }
     return base
 
+# 🛡️ v3: ab (results, failures) deta hai — bare except khatam
 def fetch_all_analytics(apps):
     log.info(f"Fetching Analytics for {len(apps)} apps...")
-    results = {t: [] for t in ANALYTICS_REPORT_MAP.values()}
+    results  = {t: [] for t in ANALYTICS_REPORT_MAP.values()}
+    failures = 0
 
     for app in apps:
         app_id, app_name = app["id"], app["name"]
         request_id = ensure_analytics_request(app_id)
         if not request_id:
+            log.warning(f"  No analytics request for {app_name}")
+            failures += 1
             continue
 
         try:
@@ -678,6 +701,7 @@ def fetch_all_analytics(apps):
             reports = resp.json().get("data", [])
         except Exception as e:
             log.warning(f"  Reports list error {app_name}: {e}")
+            failures += 1
             continue
 
         for report in reports:
@@ -689,7 +713,7 @@ def fetch_all_analytics(apps):
                     table_name = tbl
                     break
             if not table_name:
-                continue
+                continue      # hamara table nahi — nakami nahi
 
             try:
                 resp = requests.get(
@@ -698,7 +722,9 @@ def fetch_all_analytics(apps):
                     headers=auth(), timeout=30
                 )
                 instances = resp.json().get("data", [])
-            except:
+            except Exception as e:                       # 🛡️ v3: bare except khatam
+                log.warning(f"  instances error {app_name}/{table_name}: {e}")
+                failures += 1
                 continue
 
             for instance in instances:
@@ -710,7 +736,9 @@ def fetch_all_analytics(apps):
                         headers=auth(), timeout=30
                     )
                     segments = resp.json().get("data", [])
-                except:
+                except Exception as e:                   # 🛡️ v3
+                    log.warning(f"  segments error {app_name}/{table_name}: {e}")
+                    failures += 1
                     continue
 
                 for seg in segments:
@@ -719,19 +747,28 @@ def fetch_all_analytics(apps):
                         continue
                     try:
                         dl = requests.get(dl_url, timeout=120)
-                        if dl.status_code == 200:
-                            raw_rows = tsv_rows(dl.content)
-                            for r in raw_rows:
-                                parsed = parse_analytics_row(r, table_name, app_id, app_name, proc_date)
-                                results[table_name].append(parsed)
-                    except:
-                        pass
+                        if dl.status_code != 200:
+                            log.warning(f"  segment HTTP {dl.status_code} "
+                                        f"{app_name}/{table_name}")
+                            failures += 1                # 🛡️ v3
+                            continue
+                        for r in tsv_rows(dl.content):
+                            results[table_name].append(
+                                parse_analytics_row(r, table_name, app_id,
+                                                    app_name, proc_date))
+                    except Exception as e:               # 🛡️ v3: `pass` khatam
+                        log.warning(f"  segment download failed "
+                                    f"{app_name}/{table_name}: {e}")
+                        failures += 1
+                        continue
 
         time.sleep(0.2)
 
     for tbl, rows in results.items():
         log.info(f"  ✓ {tbl}: {len(rows)} rows")
-    return results
+    if failures:
+        log.error(f"  🚨 {failures} fetch failure(s) during analytics pull")
+    return results, failures
 
 # ─── BIGQUERY ─────────────────────────────────────────────────────────────────
 def dedup_rows(rows, key_fields):
@@ -742,7 +779,6 @@ def dedup_rows(rows, key_fields):
         seen[key] = r
     return list(seen.values())
 
-# Key fields for deduplicating each analytics table
 ANALYTICS_DEDUP_KEYS = {
     "analytics_sessions":              ["date", "app_id", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
     "analytics_installs":              ["date", "app_id", "event", "download_type", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
@@ -762,52 +798,55 @@ def get_bq():
     return bigquery.Client(project=GCP_PROJECT, credentials=creds)
 
 def ensure_dataset(bq):
-    try: bq.get_dataset(BQ_DATASET)
-    except:
+    try:
+        bq.get_dataset(BQ_DATASET)
+    except Exception:
         log.info(f"Creating dataset {BQ_DATASET}")
         bq.create_dataset(bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}"))
 
 def ensure_table(bq, name):
     ref = bq.dataset(BQ_DATASET).table(name)
-    try: bq.get_table(ref)
-    except:
+    try:
+        bq.get_table(ref)
+    except Exception:
         log.info(f"Creating table {name}")
         bq.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
+# 🛡️ v3: ATOMIC — staging + BEGIN TRANSACTION
 def load_to_bq(bq, name, rows, delete_filter=None):
-    """
-    FIX v2: Batch load jobs — no streaming buffer.
-    delete_filter: SQL WHERE clause string for clearing existing data.
+    """v3: DELETE aur INSERT ya dono chalte hain ya kuch nahi.
+
+    v2: DELETE pehle, load baad mein, aur load fail pe sirf log.error →
+    us poori range ka data ghayab aur script phir bhi exit 0.
     """
     if not rows:
         log.info(f"  No rows for {name}")
         return
 
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
+    stg_ref   = f"{table_ref}_stg"
 
-    # Step 1: Delete existing data
-    if delete_filter:
-        try:
-            bq.query(f"DELETE FROM `{table_ref}` WHERE {delete_filter}").result()
-            log.info(f"  Cleared {name} ({delete_filter})")
-        except Exception as e:
-            log.warning(f"  Could not clear {name}: {e}")
+    # Step 1: PEHLE staging mein. Yahan fail hua to asli table salamat.
+    job_config = bigquery.LoadJobConfig(
+        schema=SCHEMAS[name],
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    bq.load_table_from_json(rows, stg_ref, job_config=job_config).result()
 
-    # Step 2: Batch load job
-    try:
-        job_config = bigquery.LoadJobConfig(
-            schema=SCHEMAS[name],
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        )
-        load_job = bq.load_table_from_json(rows, table_ref, job_config=job_config)
-        load_job.result()
-        log.info(f"  ✅ {len(rows):,} rows → {name}")
-    except Exception as e:
-        log.error(f"  Load job failed [{name}]: {e}")
+    # Step 2: ek atomic transaction
+    where = f"WHERE {delete_filter}" if delete_filter else ""
+    bq.query(f"""
+        BEGIN TRANSACTION;
+          DELETE FROM `{table_ref}` {where};
+          INSERT INTO `{table_ref}` SELECT * FROM `{stg_ref}`;
+        COMMIT TRANSACTION;
+    """).result()
+    log.info(f"  ✅ {len(rows):,} rows → {name} (atomic)")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🍎 Apple App Store Connect → BigQuery v2 (14 tables)")
+    log.info("🍎 Apple App Store Connect → BigQuery v3 (14 tables)")
+    log.info(f"   Dataset:          {BQ_DATASET}")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
     log.info(f"   Finance lookback: {FINANCE_LOOKBACK_MONTHS} months")
 
@@ -817,7 +856,7 @@ def main():
         ensure_table(bq, t)
 
     start, end = get_sales_date_range()
-    sales_filter = f"date BETWEEN '{start}' AND '{end}'"  # report date column
+    sales_filter = f"date BETWEEN '{start}' AND '{end}'"
     sub_filter   = f"date BETWEEN '{start}' AND '{end}'"
     evt_filter   = f"event_date BETWEEN '{start}' AND '{end}'"
 
@@ -829,48 +868,58 @@ def main():
 
     log.info("── Finance Reports ──")
     finance_rows = fetch_finance_monthly()
-    # FIX v2: Delete by each report_month before loading — no duplicate months
-    today = date.today()
-    for i in range(1, FINANCE_LOOKBACK_MONTHS + 1):
-        report_month = (today - relativedelta(months=i)).strftime("%Y-%m")
-        try:
-            bq.query(
-                f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.finance_monthly` "
-                f"WHERE report_month = '{report_month}'"
-            ).result()
-            log.info(f"  Cleared finance_monthly for {report_month}")
-        except Exception as e:
-            log.warning(f"  Could not clear finance_monthly {report_month}: {e}")
-    # Load all finance rows in one batch
-    load_to_bq(bq, "finance_monthly", finance_rows)  # no delete_filter — already cleared above
+    if finance_rows:
+        # 🛡️ v3: months ki LIST se DELETE (range nahi), aur atomic load_to_bq se
+        months = sorted({r["report_month"] for r in finance_rows if r.get("report_month")})
+        month_list = ",".join(f"'{m}'" for m in months)
+        load_to_bq(bq, "finance_monthly", finance_rows,
+                   f"report_month IN ({month_list})")
+    else:
+        log.warning("  No finance rows — nothing deleted, nothing loaded")
 
     log.info("── Analytics Reports ──")
     apps = get_all_apps()
-    if apps:
-        analytics = fetch_all_analytics(apps)
-        for table_name, rows in analytics.items():
-            if not rows:
-                log.info(f"  No rows for {table_name}")
-                continue
-            # FIX v2: Delete date range found in fetched data before loading
-            dates = [r.get("date") for r in rows if r.get("date")]
-            # Deduplicate rows before loading — Apple can return duplicate segments
-            key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
-            if key_fields:
-                before = len(rows)
-                rows = dedup_rows(rows, key_fields)
-                if len(rows) < before:
-                    log.info(f"  Deduped {table_name}: {before} → {len(rows)} rows")
-            if dates:
-                min_d, max_d = min(dates), max(dates)
-                analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"
-                load_to_bq(bq, table_name, rows, analytics_filter)
-            else:
-                load_to_bq(bq, table_name, rows)
-    else:
-        log.warning("  No apps found — skipping analytics")
+    if not apps:
+        log.error("🚨 No apps found — skipping analytics entirely "
+                  "(existing data preserved).")
+        sys.exit(1)
 
-    log.info("✅ Apple App Store Connect sync v2 complete! 14 tables.")
+    analytics, failures = fetch_all_analytics(apps)
+
+    # 🛡️ GUARD 1: adhoora fetch = DELETE bilkul nahi.
+    #    Yehi guard na hone ki wajah se Jan/Feb/Mar/May aur June ke 18 din gaye.
+    if failures:
+        log.error(f"🚨 {failures} fetch failure(s) — analytics rows are "
+                  f"INCOMPLETE. Skipping delete+load entirely so existing "
+                  f"data is preserved. Fix access and re-run.")
+        sys.exit(1)
+
+    for table_name, rows in analytics.items():
+        if not rows:
+            log.info(f"  No rows for {table_name}")
+            continue
+
+        key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
+        if key_fields:
+            before = len(rows)
+            rows = dedup_rows(rows, key_fields)
+            if len(rows) < before:
+                log.info(f"  Deduped {table_name}: {before} → {len(rows)} rows")
+
+        # 🛡️ GUARD 2: range NAHI — sirf wahi din jo asal mein aaye hain.
+        #    `BETWEEN min AND max` beech ke un dinon ko bhi uda deta tha jo
+        #    is baar nahi aaye. Aadha saal isi ek lafz se gaya.
+        days = sorted({str(r["date"])[:10] for r in rows if r.get("date")})
+        if not days:
+            log.warning(f"  {table_name}: no usable dates — skipping")
+            continue
+
+        day_list = ",".join(f"'{d}'" for d in days)
+        log.info(f"  {table_name}: replacing {len(days)} day(s) "
+                 f"({days[0]} … {days[-1]})")
+        load_to_bq(bq, table_name, rows, f"date IN ({day_list})")
+
+    log.info("✅ Apple App Store Connect sync v3 complete! 14 tables.")
 
 if __name__ == "__main__":
     main()
