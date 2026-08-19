@@ -131,6 +131,16 @@ def get_sales_date_range():
 # ─── SCHEMAS ─────────────────────────────────────────────────────────────────
 S = bigquery.SchemaField
 SCHEMAS = {
+    # 🆕 v4: app catalog — apple_id ↔ bundle_id ↔ sku
+    #    Ye table app_master_v2.ios_bundle_id bharne ke liye lazmi hai.
+    "apps_dim": [
+        bigquery.SchemaField("apple_id",       "STRING"),
+        bigquery.SchemaField("bundle_id",      "STRING"),
+        bigquery.SchemaField("sku",            "STRING"),
+        bigquery.SchemaField("name",           "STRING"),
+        bigquery.SchemaField("primary_locale", "STRING"),
+        bigquery.SchemaField("_loaded_at",     "TIMESTAMP"),
+    ],
     "sales_daily": [
         S("date","DATE"),
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
@@ -539,7 +549,17 @@ def get_all_apps():
             resp = requests.get(url, params=params, headers=auth(), timeout=60)
             data = resp.json()
             for a in data.get("data", []):
-                apps.append({"id": a["id"], "name": a["attributes"].get("name", "")})
+                at = a.get("attributes", {}) or {}
+                apps.append({
+                    "id":   a["id"],
+                    "name": at.get("name", ""),
+                    # 🆕 v4: bundleId + sku — API ye pehle se de raha tha,
+                    #       hum utha hi nahi rahe the. Isi ki wajah se
+                    #       app_master_v2 mein ios_bundle_id khaali reh gaya.
+                    "bundle_id":      at.get("bundleId"),
+                    "sku":            at.get("sku"),
+                    "primary_locale": at.get("primaryLocale"),
+                })
             url = data.get("links", {}).get("next")
             params = {}
         except Exception as e:
@@ -879,6 +899,26 @@ def main():
 
     log.info("── Analytics Reports ──")
     apps = get_all_apps()
+
+    # 🆕 v4: apps_dim — apple_id ↔ bundle_id ↔ sku
+    #    /v1/apps se data pehle se aa raha tha, ab table mein bhi jayega.
+    if apps:
+        _ts = now_ts()
+        _dim = [{
+            "apple_id":       str(a.get("id") or ""),
+            "bundle_id":      a.get("bundle_id"),
+            "sku":            a.get("sku"),
+            "name":           a.get("name"),
+            "primary_locale": a.get("primary_locale"),
+            "_loaded_at":     _ts,
+        } for a in apps]
+        _nb = sum(1 for d in _dim if d["bundle_id"])
+        load_to_bq(bq, "apps_dim", _dim, "TRUE")
+        log.info(f"  🔑 apps_dim: {len(_dim)} apps · bundle_id bhara {_nb}/{len(_dim)}")
+        if _nb == 0:
+            log.warning("  ⚠️  bundle_id kisi par nahi aaya — API key ka ROLE check karein "
+                        "(App Store Connect → Users and Access → Integrations → Keys → "
+                        "'App Manager' ya 'Admin' chahiye)")
     if not apps:
         log.error("🚨 No apps found — skipping analytics entirely "
                   "(existing data preserved).")
