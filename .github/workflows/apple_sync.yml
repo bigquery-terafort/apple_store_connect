@@ -1,28 +1,30 @@
 # =============================================================================
-#  Apple App Store Connect → BigQuery Sync                          (v2.0)
+#  Apple App Store Connect → BigQuery Sync                          (v3.0)
 #  repo: bigquery-terafort/apple_store_connect
 #  path: .github/workflows/apple_sync.yml
 # =============================================================================
-#  v1.0 SE KYA BADLA — 5 FIXES:
+#  v2.0 SE KYA BADLA — 5 FIXES:
 #
-#   1. 🔴 KEEPALIVE JOB
-#      GitHub 60 din tak repo par koi commit na ho to scheduled workflow
-#      CHUP-CHAAP band kar deta hai — koi alert nahi aata. Hamare saath
-#      AdMob-4 par ye ho chuka hai (2 din ka data gum ho gaya tha).
-#      ⚠️ Koi third-party action NAHI — org policy sirf GitHub/verified
-#         actions ki ijazat deti hai. Seedha git use kiya hai.
+#   1. 🔴 TIMEOUT 60 → 150 MINUTES
+#      Run #181 ne 37m 35s liye THE RETRIES SE PEHLE. v4 script har HTTP
+#      call par 3 retries lagati hai (backoff ke saath) — ek bura din
+#      aasani se 60 min cross kar sakta hai aur job beech mein kat jati.
 #
-#   2. 🆕 BQ_DATASET env var
-#      Pehle dataset script mein hardcode tha. Ab yahan se aata hai —
-#      dono accounts (spartans / terafort_us) ek hi script se chal sakte hain.
+#   2. 🆕 RETRY KNOBS env se
+#      HTTP_RETRIES / HTTP_BACKOFF / SEGMENT_TIMEOUT / API_TIMEOUT
+#      Ab bina code chhue tune ho sakte hain.
 #
-#   3. 🆕 apps_dim ka health check
-#      Run ke baad batata hai ke apps_dim bani ya nahi, aur kitne
-#      bundle_id bhare. Chup-chaap fail nahi hogi.
+#   3. 🆕 EXIT CODE 1 KA MATLAB BADAL GAYA
+#      v3 script: 1 = "kuch load nahi hua" (poora run zaya)
+#      v4 script: 1 = "kuch app/table chhoot gaye, BAQI SAB LOAD HO GAYA"
+#      Is liye health check ab `if: always()` par bhi asli row counts
+#      dikhata hai — red X ka matlab ab data-loss NAHI hai.
 #
-#   4. permissions: contents: write   (keepalive ke commit ke liye)
+#   4. 🆕 HEALTH CHECK MEIN FRESHNESS
+#      Sirf row count nahi — har analytics table ka MAX(date) bhi, taake
+#      "table bhari hui hai magar 6 din purani" chhup na sake.
 #
-#   5. timeout + concurrency guard
+#   5. Baqi v2 jaisa: keepalive job, concurrency guard, BQ_DATASET var.
 #
 #  SECRETS: APPLE_KEY_ID · APPLE_ISSUER_ID · APPLE_PRIVATE_KEY ·
 #           APPLE_VENDOR_NUMBER · GCP_PROJECT · GCP_CREDENTIALS_JSON
@@ -40,9 +42,15 @@ on:
       finance_lookback_months:
         description: "Finance ke kitne mahine"
         default: "6"
+      http_retries:
+        description: "Har HTTP call par kitni retries (default 3)"
+        default: "3"
+      segment_timeout:
+        description: "S3 segment download timeout, seconds (default 300)"
+        default: "300"
 
 permissions:
-  contents: write                # 🔧 keepalive commit ke liye (v1 mein nahi tha)
+  contents: write                # keepalive commit ke liye
 
 concurrency:
   group: apple-sync
@@ -52,7 +60,7 @@ jobs:
   sync:
     name: Sync Apple App Store Connect Data to BigQuery
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150         # 🔧 v3: 60 se barha — retries waqt lete hain
 
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +76,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests pyjwt cryptography google-cloud-bigquery
+            pip install requests pyjwt cryptography google-cloud-bigquery python-dateutil
           fi
 
       - name: Run sync
@@ -79,15 +87,19 @@ jobs:
           APPLE_VENDOR_NUMBER:     ${{ secrets.APPLE_VENDOR_NUMBER }}
           GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
-          # 🆕 dataset ab yahan se — script mein hardcode na rahe
           #    spartans        → apple_store_data
           #    terafort_us     → apple_console_terafort_us
           BQ_DATASET:              ${{ vars.BQ_DATASET || 'apple_store_data' }}
           SALES_LOOKBACK_DAYS:     ${{ github.event.inputs.sales_lookback_days || '7' }}
           FINANCE_LOOKBACK_MONTHS: ${{ github.event.inputs.finance_lookback_months || '3' }}
+          # 🆕 v3: retry tuning bina code chhue
+          HTTP_RETRIES:            ${{ github.event.inputs.http_retries || '3' }}
+          HTTP_BACKOFF:            '5'
+          SEGMENT_TIMEOUT:         ${{ github.event.inputs.segment_timeout || '300' }}
+          API_TIMEOUT:             '60'
         run: python apple_to_bigquery.py
 
-      # 🆕 apps_dim bani ya nahi — chup-chaap fail na ho
+      # Health check — ab freshness bhi, sirf row count nahi
       - name: Health check
         if: always()
         env:
@@ -102,39 +114,58 @@ jobs:
           from google.cloud import bigquery
           bq = bigquery.Client(project=os.environ["GCP_PROJECT"])
           ds = f'{os.environ["GCP_PROJECT"]}.{os.environ["BQ_DATASET"]}'
-          print(f"\n── {ds} " + "─"*30)
+          print(f"\n── {ds} " + "─"*40)
 
-          for t in ["apps_dim", "sales_daily", "finance_monthly",
-                    "analytics_installs", "analytics_sessions"]:
+          DATED = {
+              "sales_daily":                    "date",
+              "analytics_installs":             "date",
+              "analytics_sessions":             "date",
+              "analytics_app_store_downloads":  "date",
+              "analytics_app_store_discovery":  "date",
+          }
+
+          for t, col in DATED.items():
               try:
-                  q = f"SELECT COUNT(*) n FROM `{ds}.{t}`"
-                  n = list(bq.query(q).result())[0].n
-                  print(f"   ✅ {t:<24} {n:>9,} rows")
-              except Exception:
-                  mark = "🔴" if t == "apps_dim" else "⚠️ "
-                  print(f"   {mark} {t:<24} table nahi mili")
+                  r = list(bq.query(
+                      f"SELECT COUNT(*) n, CAST(MAX({col}) AS STRING) last_dt, "
+                      f"DATE_DIFF(CURRENT_DATE(), MAX({col}), DAY) stale "
+                      f"FROM `{ds}.{t}`").result())[0]
+                  mark = "OK " if (r.stale is not None and r.stale <= 4) else "OLD"
+                  print(f"   [{mark}] {t:<32} {r.n:>10,} rows · last {r.last_dt} "
+                        f"({r.stale}d)")
+              except Exception as e:
+                  print(f"   [MISS] {t:<32} {type(e).__name__}")
 
-          # 🔑 apps_dim ka bundle coverage — yehi asal maqsad hai
+          try:
+              r = list(bq.query(f"SELECT COUNT(*) n FROM `{ds}.finance_monthly`").result())[0]
+              print(f"   [OK ] {'finance_monthly':<32} {r.n:>10,} rows")
+          except Exception:
+              print(f"   [MISS] finance_monthly")
+
+          # apps_dim ka bundle coverage — app_master_v2.ios_bundle_id ke liye lazmi
           try:
               q = f"""SELECT COUNT(*) apps,
                              COUNTIF(bundle_id IS NOT NULL AND TRIM(bundle_id)!='') bundles,
                              CAST(MAX(_loaded_at) AS STRING) last_load
                       FROM `{ds}.apps_dim`"""
               r = list(bq.query(q).result())[0]
-              print(f"\n   🔑 apps_dim: {r.apps} apps · bundle_id bhara {r.bundles}/{r.apps}")
-              print(f"      aakhri load: {r.last_load}")
+              print(f"\n   apps_dim: {r.apps} apps · bundle_id bhara {r.bundles}/{r.apps}")
+              print(f"   aakhri load: {r.last_load}")
               if r.bundles < r.apps:
-                  print("      ⚠️  kuch apps par bundle_id khaali hai")
+                  print("   ⚠️  kuch apps par bundle_id khaali hai")
           except Exception as e:
               print(f"\n   🔴 apps_dim NAHI BANI — {type(e).__name__}")
               print("      → API key ka role check karein:")
               print("        App Store Connect → Users and Access → Integrations")
               print("        → Keys → role 'App Manager' ya 'Admin' hona chahiye")
               print("        ('Sales and Reports' role /v1/apps parh nahi sakta)")
+
+          print("\n   NOTE: v4 mein exit code 1 ka matlab 'kuch app/table chhoot gaye'")
+          print("         hai — 'kuch load nahi hua' NAHI. Upar ke counts dekhein.")
           EOF
 
   # ═══════════════════════════════════════════════════════════════════════
-  #  🔴 KEEPALIVE — 60-din wala auto-disable rokta hai
+  #  KEEPALIVE — 60-din wala auto-disable rokta hai
   #     Koi third-party action nahi (org policy blocks) — seedha git.
   # ═══════════════════════════════════════════════════════════════════════
   keepalive:
