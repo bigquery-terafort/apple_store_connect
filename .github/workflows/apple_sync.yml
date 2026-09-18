@@ -83,6 +83,7 @@ jobs:
           fi
 
       - name: Run sync
+        if: steps.before.outputs.skip != 'true'
         env:
           APPLE_KEY_ID:            ${{ secrets.APPLE_KEY_ID }}
           APPLE_ISSUER_ID:         ${{ secrets.APPLE_ISSUER_ID }}
@@ -172,7 +173,7 @@ jobs:
       # 🔁 RETRY — neeche wala main step 3 baar koshish karta hai.
       #    (nick-fields/retry se: platform API 5xx / timeout par khud dobara)
       - name: Health check
-        if: steps.before.outputs.skip != 'true' && (always())
+        if: always()
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
